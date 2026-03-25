@@ -15,3 +15,22 @@ sig_source:
     - [cosine,   2000, 0.8, 10]
     - [square,    500, 1.2, 10]
     - [triangle, 1500, 0.6, 10]
+
+agc:
+  tx_script: experiments/agc/tx.py
+  rx_script: experiments/agc/rx.py
+  analyze_script: experiments/agc/analyze.py
+
+  metrics: [settling_time, output_power_stability, overshoot]
+
+  thresholds:
+    settling_time: 0.2
+    output_power_stability: 0.1
+    overshoot: 0.05
+
+  input_format: [input_amplitude, gain_step, duration]
+
+  input_options:
+    - [0.1, 1.0, 8]
+    - [0.5, 2.0, 8]
+    - [1.0, 3.0, 8]
