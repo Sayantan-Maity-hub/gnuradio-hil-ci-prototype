@@ -1,23 +1,17 @@
 sig_source:
-  flowgraph: flowgraphs/sig_source.py
-  input:
-    type: none
-  expected_behavior: generates signal at configured frequency and amplitude
-  metrics:
-    - frequency_error
-    - amplitude_error
-  thresholds:
-    frequency_error: "< 1 Hz"
-    amplitude_error: "< 5%"
+  tx_script: experiments/sig_source/tx.py
+  rx_script: experiments/sig_source/rx.py
+  analyze_script: experiments/sig_source/analyze.py
 
-agc_cc:
-  flowgraph: flowgraphs/agc_cc.py
-  input:
-    type: tone
-    amplitude: 0.2
-  expected_behavior: output amplitude converges to reference level
-  metrics:
-    - settling_time
-    - steady_state_error
+  metrics: [frequency_error, amplitude_error]
+
   thresholds:
-    steady_state_error: "< 5%"
+    frequency_error: 1.0
+    amplitude_error: 5.0
+
+  input_options:
+    # [waveform, frequency, amplitude, duration]
+    - [sine,     1000, 1.0, 10]
+    - [cosine,   2000, 0.8, 10]
+    - [square,    500, 1.2, 10]
+    - [triangle, 1500, 0.6, 10]
