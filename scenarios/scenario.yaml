@@ -1,0 +1,11 @@
+description: GNU Radio HIL CI experiment
+duration: 300
+nodes:
+  mnode11.cortexlab.fr:
+    container:
+      - image: ghcr.io/org/repo:sha-abc123
+        command: python3 /app/tx.py --config /app/run_config.json
+  mnode36.cortexlab.fr:
+    container:
+      - image: ghcr.io/org/repo:sha-abc123
+        command: python3 /app/rx.py --config /app/run_config.json

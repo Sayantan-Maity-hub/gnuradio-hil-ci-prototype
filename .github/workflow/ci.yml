@@ -1,0 +1,8 @@
+- name: Build Docker Image
+  run: |
+    docker build -t hil-test:${{ github.sha }} .
+
+- name: Push Docker Image
+  run: |
+    docker tag hil-test:${{ github.sha }} ghcr.io/${{ github.repository }}/hil-test:${{ github.sha }}
+    docker push ghcr.io/${{ github.repository }}/hil-test:${{ github.sha }}

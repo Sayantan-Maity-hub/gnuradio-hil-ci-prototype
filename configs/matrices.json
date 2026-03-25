@@ -1,0 +1,12 @@
+{
+  "metrics": {
+    "frequency_error": {},
+    "amplitude_error": {},
+    "correlation": {}
+  },
+  "thresholds": {
+    "frequency_error": 50,
+    "amplitude_error": 0.1,
+    "correlation": 0.95
+  }
+}
