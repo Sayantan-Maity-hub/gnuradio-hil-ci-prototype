@@ -1,0 +1,18 @@
+description: "{block_name} hardware test"
+duration: {duration}
+
+nodes:
+  {tx_node}:
+    container:
+      - image: {image_tag}
+        command: >
+          python3 {tx_script} {tx_args}
+
+  {rx_node}:
+    container:
+      - image: {image_tag}
+        command: >
+          python3 {rx_script} {rx_args}
+
+post_processing:
+  - python3 {analyze_script} {analyze_args}

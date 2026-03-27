@@ -1,0 +1,28 @@
+description: "agc hardware test"
+duration: {duration}
+
+nodes:
+  {tx_node}:
+    container:
+      - image: {image_tag}
+        command: >
+          python3 {tx_script}
+          --input-amplitude {input_amplitude}
+          --gain-step {gain_step}
+          --duration {duration}
+
+  {rx_node}:
+    container:
+      - image: {image_tag}
+        command: >
+          python3 {rx_script}
+          --output agc_trace.dat
+          --duration {duration}
+
+post_processing:
+  - python3 {analyze_script}
+    --input agc_trace.dat
+    --settling-threshold {settling_time}
+    --stability-threshold {output_power_stability}
+    --overshoot-threshold {overshoot}
+    --output result.json

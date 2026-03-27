@@ -1,0 +1,21 @@
+description: sig_source hardware test
+duration: {duration}
+
+nodes:
+  {tx_node}:
+    container:
+      - image: {image_tag}
+        command: >
+          python3 {tx_script}
+          --waveform {waveform}
+          --frequency {frequency}
+          --amplitude {amplitude}
+          --duration {duration}
+
+  {rx_node}:
+    container:
+      - image: {image_tag}
+        command: >
+          python3 {rx_script}
+          --duration {duration}
+          --output {output_file}
