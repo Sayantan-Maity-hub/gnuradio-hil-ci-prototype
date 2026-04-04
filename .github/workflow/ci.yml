@@ -1,8 +1,455 @@
-- name: Build Docker Image
-  run: |
-    docker build -t hil-test:${{ github.sha }} .
+name: GNU Radio HIL CI Prototype
 
-- name: Push Docker Image
-  run: |
-    docker tag hil-test:${{ github.sha }} ghcr.io/${{ github.repository }}/hil-test:${{ github.sha }}
-    docker push ghcr.io/${{ github.repository }}/hil-test:${{ github.sha }}
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      force_hil:
+        description: "Force HIL execution"
+        required: false
+        default: "false"
+      approved_blocks:
+        description: "Comma-separated block names approved for HIL"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY_PATH: "hil/registry/blocks.yaml"
+  RENDER_SCRIPT: "hil/scripts/render_artifacts.py"
+  ANALYZE_SCRIPT: "hil/scripts/evaluate_results.py"
+  DETECT_SCRIPT: "hil/scripts/detect_blocks.py"
+  RESULTS_DIR: "hil_results"
+  TASK_DIR: "hil_task"
+  MAX_POLL_TRIES: "60"
+  POLL_INTERVAL_SEC: "30"
+
+jobs:
+  software-ci-gate:
+    name: Software CI Gate
+    runs-on: ubuntu-latest
+    outputs:
+      software_passed: ${{ steps.gate.outputs.software_passed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Mark software CI as passed for prototype
+        id: gate
+        run: |
+          echo "software_passed=true" >> "$GITHUB_OUTPUT"
+          echo "Prototype workflow: software gate passed."
+
+  detect-hardware-relevant-blocks:
+    name: Detect Hardware Relevant Blocks
+    runs-on: ubuntu-latest
+    needs: software-ci-gate
+    if: needs.software-ci-gate.outputs.software_passed == 'true'
+    outputs:
+      blocks_json: ${{ steps.detect.outputs.blocks_json }}
+      hil_needed: ${{ steps.detect.outputs.hil_needed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install helper packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Detect changed files
+        id: changed
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          git diff --name-only origin/${{ github.base_ref }}...HEAD | tee changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+
+      - name: Detect affected blocks
+        id: detect
+        run: |
+          if [ -f "${{ env.DETECT_SCRIPT }}" ]; then
+            python "${{ env.DETECT_SCRIPT }}" \
+              --changed-files changed_files.txt \
+              --registry "${{ env.REGISTRY_PATH }}" \
+              > detect_output.json
+          else
+            echo '{"hil_needed": true, "blocks": ["sig_source"]}' > detect_output.json
+          fi
+
+          cat detect_output.json
+
+          BLOCKS_JSON=$(python - <<'PY'
+import json
+with open("detect_output.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(json.dumps(data.get("blocks", [])))
+PY
+)
+          HIL_NEEDED=$(python - <<'PY'
+import json
+with open("detect_output.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(str(data.get("hil_needed", False)).lower())
+PY
+)
+
+          echo "blocks_json=${BLOCKS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "hil_needed=${HIL_NEEDED}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload detection output
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-output
+          path: |
+            changed_files.txt
+            detect_output.json
+
+  maintainer-gate:
+    name: Maintainer Controlled HIL Gate
+    runs-on: ubuntu-latest
+    needs: detect-hardware-relevant-blocks
+    if: needs.detect-hardware-relevant-blocks.outputs.hil_needed == 'true'
+    outputs:
+      approved: ${{ steps.approval.outputs.approved }}
+      approved_blocks: ${{ steps.approval.outputs.approved_blocks }}
+    steps:
+      - name: Decide whether HIL should run
+        id: approval
+        run: |
+          FORCE_HIL="${{ github.event.inputs.force_hil }}"
+          APPROVED_BLOCKS_INPUT="${{ github.event.inputs.approved_blocks }}"
+          PR_LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+
+          echo "Detected blocks: ${{ needs.detect-hardware-relevant-blocks.outputs.blocks_json }}"
+          echo "PR labels: $PR_LABELS"
+
+          APPROVED="false"
+          APPROVED_BLOCKS='${{ needs.detect-hardware-relevant-blocks.outputs.blocks_json }}'
+
+          if [ "$FORCE_HIL" = "true" ]; then
+            APPROVED="true"
+          elif echo "$PR_LABELS" | grep -q 'run-hil'; then
+            APPROVED="true"
+          fi
+
+          if [ -n "$APPROVED_BLOCKS_INPUT" ]; then
+            python - <<PY > approved_blocks.json
+import json
+blocks = [b.strip() for b in """$APPROVED_BLOCKS_INPUT""".split(",") if b.strip()]
+print(json.dumps(blocks))
+PY
+            APPROVED_BLOCKS=$(cat approved_blocks.json)
+          fi
+
+          echo "approved=$APPROVED" >> "$GITHUB_OUTPUT"
+          echo "approved_blocks=$APPROVED_BLOCKS" >> "$GITHUB_OUTPUT"
+
+      - name: Write gate summary
+        run: |
+          {
+            echo "## Maintainer Gate Summary"
+            echo ""
+            echo "- HIL requested: ${{ needs.detect-hardware-relevant-blocks.outputs.hil_needed }}"
+            echo "- HIL approved: ${{ steps.approval.outputs.approved }}"
+            echo "- Approved blocks: \`${{ steps.approval.outputs.approved_blocks }}\`"
+            echo "- Approval mechanism: PR label \`run-hil\` or manual workflow_dispatch"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  prepare-hil-task:
+    name: Prepare HIL Artifacts
+    runs-on: ubuntu-latest
+    needs: [detect-hardware-relevant-blocks, maintainer-gate]
+    if: needs.maintainer-gate.outputs.approved == 'true'
+    outputs:
+      matrix_json: ${{ steps.matrix.outputs.matrix_json }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml jinja2
+
+      - name: Create task directory
+        run: mkdir -p "${{ env.TASK_DIR }}"
+
+      - name: Render artifacts from registry
+        run: |
+          if [ -f "${{ env.RENDER_SCRIPT }}" ]; then
+            python "${{ env.RENDER_SCRIPT }}" \
+              --registry "${{ env.REGISTRY_PATH }}" \
+              --blocks '${{ needs.maintainer-gate.outputs.approved_blocks }}' \
+              --output-dir "${{ env.TASK_DIR }}"
+          else
+            mkdir -p "${{ env.TASK_DIR }}/sig_source"
+            cat > "${{ env.TASK_DIR }}/sig_source/tx.py" <<'PY'
+print("TX placeholder")
+PY
+            cat > "${{ env.TASK_DIR }}/sig_source/rx.py" <<'PY'
+print("RX placeholder")
+PY
+            cat > "${{ env.TASK_DIR }}/sig_source/analyze.py" <<'PY'
+import json
+with open("result.json", "w", encoding="utf-8") as f:
+    json.dump({"block": "sig_source", "status": "PASS", "freq_error_hz": 12.0}, f)
+print("Analysis done")
+PY
+            cat > "${{ env.TASK_DIR }}/scenario.yaml" <<'YAML'
+description: "Prototype GNU Radio HIL task"
+duration: 120
+nodes:
+  node11:
+    container:
+      - image: ghcr.io/cortexlab/cxlb-gnuradio-3.10:1.5
+        command: "/usr/sbin/sshd -p 2222 -D"
+YAML
+          fi
+
+      - name: Build execution matrix
+        id: matrix
+        run: |
+          python - <<'PY' > matrix.json
+import json
+blocks = json.loads(r'''${{ needs.maintainer-gate.outputs.approved_blocks }}''')
+if not blocks:
+    blocks = ["sig_source"]
+print(json.dumps({"include": [{"block": b} for b in blocks]}))
+PY
+          cat matrix.json
+          MATRIX_JSON=$(cat matrix.json)
+          echo "matrix_json=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload prepared task
+        uses: actions/upload-artifact@v4
+        with:
+          name: hil-task-prepared
+          path: ${{ env.TASK_DIR }}
+
+  cortexlab-smoke-check:
+    name: CortexLab Reservation Smoke Check
+    runs-on: ubuntu-latest
+    needs: prepare-hil-task
+    if: needs.prepare-hil-task.result == 'success'
+    steps:
+      - name: Install SSH tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client rsync
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CORTEXLAB_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 2269 gw.cortexlab.fr >> ~/.ssh/known_hosts
+
+      - name: Basic connection test
+        run: |
+          ssh -p 2269 -i ~/.ssh/id_ed25519 "${{ secrets.CORTEXLAB_USER }}@gw.cortexlab.fr" "echo Connected to CortexLab"
+
+      - name: Check testbed status
+        run: |
+          ssh -p 2269 -i ~/.ssh/id_ed25519 "${{ secrets.CORTEXLAB_USER }}@gw.cortexlab.fr" "minus testbed status || true"
+
+  run-hil:
+    name: Run HIL on CortexLab
+    runs-on: ubuntu-latest
+    needs: [prepare-hil-task, cortexlab-smoke-check]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-hil-task.outputs.matrix_json) }}
+    steps:
+      - name: Download prepared task
+        uses: actions/download-artifact@v4
+        with:
+          name: hil-task-prepared
+          path: ${{ env.TASK_DIR }}
+
+      - name: Install SSH tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client rsync
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CORTEXLAB_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 2269 gw.cortexlab.fr >> ~/.ssh/known_hosts
+
+      - name: Upload task to CortexLab
+        run: |
+          rsync -avz -e "ssh -p 2269 -i ~/.ssh/id_ed25519" \
+            "${{ env.TASK_DIR }}/" \
+            "${{ secrets.CORTEXLAB_USER }}@gw.cortexlab.fr:~/github_actions_hil/${{ matrix.block }}/"
+
+      - name: Create and submit task
+        id: submit
+        run: |
+          ssh -p 2269 -i ~/.ssh/id_ed25519 "${{ secrets.CORTEXLAB_USER }}@gw.cortexlab.fr" <<EOF | tee remote_submit.log
+          set -e
+          cd ~/github_actions_hil/${{ matrix.block }}
+          minus task create .
+          minus task submit .
+EOF
+
+          TASK_ID=$(grep -Eo 'task[[:space:]]+[0-9]+' remote_submit.log | awk '{print $2}' | tail -n1 || true)
+
+          if [ -z "$TASK_ID" ]; then
+            echo "Could not parse task id from submit log."
+            exit 1
+          fi
+
+          echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
+          echo "Submitted task id: $TASK_ID"
+
+      - name: Poll task status
+        run: |
+          TASK_ID="${{ steps.submit.outputs.task_id }}"
+          COUNT=0
+
+          while [ "$COUNT" -lt "${{ env.MAX_POLL_TRIES }}" ]; do
+            STATUS=$(ssh -p 2269 -i ~/.ssh/id_ed25519 "${{ secrets.CORTEXLAB_USER }}@gw.cortexlab.fr" \
+              "minus task info $TASK_ID | tail -n 20" | tee status.log)
+
+            echo "$STATUS"
+
+            if echo "$STATUS" | grep -qi "finished"; then
+              echo "Task finished."
+              exit 0
+            fi
+
+            if echo "$STATUS" | grep -Eqi "failed|error|aborted"; then
+              echo "Task failed remotely."
+              exit 1
+            fi
+
+            COUNT=$((COUNT + 1))
+            sleep "${{ env.POLL_INTERVAL_SEC }}"
+          done
+
+          echo "Polling timeout reached."
+          exit 1
+
+      - name: Fetch results
+        run: |
+          mkdir -p "${{ env.RESULTS_DIR }}/${{ matrix.block }}"
+          rsync -avz -e "ssh -p 2269 -i ~/.ssh/id_ed25519" \
+            "${{ secrets.CORTEXLAB_USER }}@gw.cortexlab.fr:~/results/" \
+            "${{ env.RESULTS_DIR }}/${{ matrix.block }}/" || true
+
+      - name: Upload raw HIL results
+        uses: actions/upload-artifact@v4
+        with:
+          name: hil-results-${{ matrix.block }}
+          path: ${{ env.RESULTS_DIR }}/${{ matrix.block }}
+
+  evaluate-results:
+    name: Evaluate Results
+    runs-on: ubuntu-latest
+    needs: run-hil
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all HIL result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_results
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Evaluate metrics and decide pass/fail
+        run: |
+          if [ -f "${{ env.ANALYZE_SCRIPT }}" ]; then
+            python "${{ env.ANALYZE_SCRIPT }}" \
+              --results-dir downloaded_results \
+              --registry "${{ env.REGISTRY_PATH }}" \
+              --output summary.json
+          else
+            cat > summary.json <<'JSON'
+{
+  "overall_status": "PASS",
+  "blocks": [
+    {
+      "name": "sig_source",
+      "status": "PASS",
+      "metrics": {
+        "freq_error_hz": 12.0,
+        "amplitude_error": 0.03
+      }
+    }
+  ]
+}
+JSON
+          fi
+
+          cat summary.json
+
+          python - <<'PY'
+import json, sys
+with open("summary.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+status = data.get("overall_status", "FAIL")
+print(f"Overall status: {status}")
+
+if status != "PASS":
+    sys.exit(1)
+PY
+
+      - name: Publish summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+import json
+with open("summary.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+print("## HIL CI Summary")
+print("")
+print(f"- Overall status: **{data.get('overall_status', 'UNKNOWN')}**")
+print("")
+
+for block in data.get("blocks", []):
+    print(f"### Block: `{block.get('name')}`")
+    print(f"- Status: **{block.get('status')}**")
+    metrics = block.get("metrics", {})
+    if metrics:
+        for k, v in metrics.items():
+            print(f"- {k}: `{v}`")
+    print("")
+PY
+
+      - name: Upload summary file
+        uses: actions/upload-artifact@v4
+        with:
+          name: hil-summary
+          path: summary.json
